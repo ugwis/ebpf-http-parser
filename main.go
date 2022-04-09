@@ -27,7 +27,7 @@ import (
 
 import "C"
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS -target native bpf kprobe.c -- -I../headers -I /usr/include -I /usr/include/x86_64-linux-gnu
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS -target native bpf kprobe.c -- -I./cilium-ebpf/examples/headers -I /usr/include -I /usr/include/x86_64-linux-gnu
 
 type dataEvent struct {
 	Type   uint8
