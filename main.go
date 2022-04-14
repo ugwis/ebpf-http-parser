@@ -27,12 +27,22 @@ import (
 
 import "C"
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS -target native bpf kprobe.c -- -I./cilium-ebpf/examples/headers -I /usr/include -I /usr/include/x86_64-linux-gnu
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS -target native -type dataevent_t bpf kprobe.c -- -I./cilium-ebpf/examples/headers -I /usr/include -I /usr/include/x86_64-linux-gnu
 
-type dataEvent struct {
+
+const (
+    EVENT_TYPE_CONNECT = iota
+    EVENT_TYPE_ACCEPT
+    EVENT_TYPE_RECV
+    EVENT_TYPE_SEND
+    EVENT_TYPE_CLOSE
+)
+
+/*type dataEvent struct {
 	Type   uint8
 	Buf    [1024]byte
-}
+	SockFd uint32
+}*/
 
 func main() {
 
@@ -49,18 +59,18 @@ func main() {
 	}
 	defer objs.Close()
 
-	//TcpV4Connect
-	kprobeTcpV4Connect, err := link.Kprobe("tcp_v4_connect", objs.KprobeTcpV4Connect)
+	// SysConnect
+	kprobeSysConnect, err := link.Kprobe("sys_connect", objs.KprobeSysConnect)
 	if err != nil {
 		log.Fatalf("opening kprobe: %s", err)
 	}
-	defer kprobeTcpV4Connect.Close()
+	defer kprobeSysConnect.Close()
 
-	kretprobeTcpV4Connect, err := link.Kretprobe("tcp_v4_connect", objs.KretprobeTcpV4Connect)
+	kretprobeSysConnect, err := link.Kretprobe("sys_connect", objs.KretprobeSysConnect)
 	if err != nil {
 		log.Fatalf("opening kprobe: %s", err)
 	}
-	defer kretprobeTcpV4Connect.Close()
+	defer kretprobeSysConnect.Close()
 
 	// SysRecvfrom
 	kprobeSysRecvfrom, err := link.Kprobe("sys_recvfrom", objs.KprobeSysRecvfrom)
@@ -88,6 +98,14 @@ func main() {
 	}
 	defer kretprobeSysSendto.Close()
 
+	// SysClose
+	kprobeSysClose, err := link.Kprobe("sys_close", objs.KprobeSysClose)
+	if err != nil {
+		log.Fatalf("opening kprobe: %s", err)
+	}
+	defer kprobeSysClose.Close()
+
+
 
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
@@ -111,9 +129,9 @@ func main() {
 
 	log.Printf("Listening for events..")
 
-	request := ""
-	response := ""
-	var event dataEvent
+	requests := map[uint32]string{}
+	responses := map[uint32]string{}
+	var event bpfDataeventT
 	for {
 		record, err := rd.Read()
 		if err != nil {
@@ -136,21 +154,41 @@ func main() {
 		}
 
 		//log.Printf("type: %d", event.Type)
+		//log.Printf("sock_fd: %d", event.SockFd)
 		//log.Printf("Buf: %s", unix.ByteSliceToString(event.Buf[:]))
+		sock_fd := event.SockFd
+		payload := unix.ByteSliceToString(event.Buf[:])
 
-		if event.Type == 1 {
-			request += unix.ByteSliceToString(event.Buf[:])
-		} else if event.Type == 0 {
-			response += unix.ByteSliceToString(event.Buf[:])
+		switch event.Type {
+			case EVENT_TYPE_CONNECT:
+			case EVENT_TYPE_ACCEPT:
+			case EVENT_TYPE_SEND:
+				_, ok := requests[sock_fd]
+				if ok {
+					requests[sock_fd] += payload
+				} else {
+					requests[sock_fd] = payload
+				}
+			case EVENT_TYPE_RECV:
+				_, ok := responses[sock_fd]
+				if ok {
+					responses[sock_fd] += payload
+				} else {
+					responses[sock_fd] = payload
+				}
+			case EVENT_TYPE_CLOSE:
+				delete(requests, sock_fd)
+				delete(responses, sock_fd)
 		}
-			req_rd := strings.NewReader(request)
+
+		req_rd := strings.NewReader(requests[sock_fd])
 		req_reader := bufio.NewReader(req_rd)
 		req, err := http.ReadRequest(req_reader)
 		if err != nil {
 			//fmt.Println(err)
 			continue
 		}
-		res_rd := strings.NewReader(response)
+		res_rd := strings.NewReader(responses[sock_fd])
 		res_reader := bufio.NewReader(res_rd)
 		res, err := http.ReadResponse(res_reader, req)
 		if err != nil {
@@ -169,9 +207,9 @@ func main() {
 				code_color = color.New(color.FgWhite, color.BgHiGreen).SprintFunc()
 		}
 
-		fmt.Printf("%s |%-s| %-15s | %-20s\n", time.Now().Format("2006/01/02 03:04:05"), code_color(" " + strconv.Itoa(res.StatusCode) + " "), req.Host, req.RequestURI)
-		request=""
-		response=""
+		fmt.Printf("%s | %s |%-s| %s | %-15s | %-20s\n", time.Now().Format("2006/01/02 03:04:05"), res.Proto, code_color(" " + strconv.Itoa(res.StatusCode) + " "), req.Method, req.Host, req.RequestURI)
+		delete(requests, sock_fd)
+		delete(responses, sock_fd)
 		/*fmt.Println(req.Method)
 		fmt.Println(req.Host)
 		fmt.Println(req.RemoteAddr)

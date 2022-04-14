@@ -5,36 +5,34 @@
 #include <linux/types.h>
 #define TASK_COMM_LEN 16
 
-#define EVENT_TYPE_RECV 0
-#define EVENT_TYPE_SEND 1
+#define EVENT_TYPE_CONNECT 0
+#define EVENT_TYPE_ACCEPT 1
+#define EVENT_TYPE_RECV 2
+#define EVENT_TYPE_SEND 3
+#define EVENT_TYPE_CLOSE 4
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
+
+struct connectlist_t {
+	int  sockfd;
+	void *sock;
+};
 struct bpf_map_def SEC("maps/connectlist") connectlist = {
 	.type        = BPF_MAP_TYPE_HASH,
 	.key_size    = sizeof(u32),
-	.value_size  = sizeof(void *),
+	.value_size  = sizeof(struct connectlist_t *),
 	.max_entries = 256,
 };
 
-struct bpf_map_def SEC("maps/acceptlist") acceptlist = {
-	.type        = BPF_MAP_TYPE_HASH,
-	.key_size    = sizeof(u32),
-	.value_size  = sizeof(void *),
-	.max_entries = 256,
+struct probe_cache_t {
+	int  sockfd;
+	void *buf;
 };
-
-struct bpf_map_def SEC("maps/recvfromlist") recvfromlist = {
+struct bpf_map_def SEC("maps/probe_cache") probe_cache = {
 	.type        = BPF_MAP_TYPE_HASH,
-	.key_size    = sizeof(u32),
-	.value_size  = sizeof(void *),
-	.max_entries = 256,
-};
-
-struct bpf_map_def SEC("maps/sendtolist") sendtolist = {
-	.type        = BPF_MAP_TYPE_HASH,
-	.key_size    = sizeof(u32),
-	.value_size  = sizeof(void *),
+	.key_size    = sizeof(u32), // pid
+	.value_size  = sizeof(struct probe_cache_t), // sockfd, *buf
 	.max_entries = 256,
 };
 
@@ -42,11 +40,14 @@ struct bpf_map_def SEC("maps/dataevent") dataevent = {
 	.type = BPF_MAP_TYPE_PERF_EVENT_ARRAY,
 };
 
+// Create Buffer on BPF map
+// BPF stack size is limited to 512 bytes
 struct dataevent_t {
 	u8   type;
-	char buf[1024];
+	u32  sock_fd;
+	u8   buf[1024];
 };
-
+const struct dataevent_t *unused __attribute__((unused));
 struct bpf_map_def SEC("maps/messagelist") messagelist = {
 	.type        = BPF_MAP_TYPE_ARRAY,
 	.key_size    = sizeof(u32),
@@ -56,10 +57,11 @@ struct bpf_map_def SEC("maps/messagelist") messagelist = {
 
 
 //
-// tcp_v4_connect
+// sys_connect
 //
-SEC("kprobe/tcp_v4_connect")
-int kprobe__tcp_v4_connect(struct pt_regs *ctx) {
+SEC("kprobe/sys_connect")
+int kprobe__sys_connect(struct pt_regs *ctx) {
+	int sockfd = (int)PT_REGS_PARM1(ctx);
 	u32 pid = bpf_get_current_pid_tgid();
 
 	struct sock *sk;
@@ -67,12 +69,158 @@ int kprobe__tcp_v4_connect(struct pt_regs *ctx) {
 
 	char comm[TASK_COMM_LEN];
 	bpf_get_current_comm(&comm, sizeof(comm));
+
 	if (comm[0] == 'c' && comm[1] == 'u') {
-		bpf_map_update_elem(&connectlist, &pid, &sk, BPF_ANY);
+		struct connectlist_t connect = {};
+		connect.sockfd = sockfd;
+		connect.sock = sk;
+		bpf_map_update_elem(&connectlist, &pid, &connect, BPF_ANY);
 	}
 	return 0;
 }
-SEC("kretprobe/tcp_v4_connect")
+SEC("kretprobe/sys_connect")
+int kretprobe__sys_connect(struct pt_regs *ctx) {
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct connectlist_t *connect;
+	connect = bpf_map_lookup_elem(&connectlist, &pid);
+	if (connect == 0) {
+		return 0;
+	}
+
+	int zero = 0;
+	struct dataevent_t* data = bpf_map_lookup_elem(&messagelist, &zero);
+	if (!data)
+		return 0;
+
+	data->type = EVENT_TYPE_CONNECT;
+	data->sock_fd = connect->sockfd;
+
+	bpf_perf_event_output(ctx, &dataevent, BPF_F_CURRENT_CPU, data, sizeof(*data));
+
+	return 0;
+}
+
+//
+// sys_recvfrom
+//
+SEC("kprobe/sys_recvfrom")
+int kprobe__sys_recvfrom(struct pt_regs *ctx) {
+	int sockfd = (int)PT_REGS_PARM1(ctx);
+	char *buf;
+	buf = (char *)PT_REGS_PARM2(ctx);
+
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct connectlist_t *connect;
+	connect = bpf_map_lookup_elem(&connectlist, &pid);
+	if (connect == 0)
+		return 0;
+
+	struct probe_cache_t cache = {};
+	cache.sockfd = sockfd; 
+	cache.buf = buf;
+	bpf_map_update_elem(&probe_cache, &pid, &cache, BPF_ANY);
+	return 0;
+}
+SEC("kretprobe/sys_recvfrom")
+int kretprobe__sys_recvfrom(struct pt_regs *ctx) {
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct probe_cache_t* cache;
+	cache = bpf_map_lookup_elem(&probe_cache, &pid);
+	if (cache == 0) 
+		return 0;
+
+	int zero = 0;
+	struct dataevent_t* data = bpf_map_lookup_elem(&messagelist, &zero);
+	if (!data)
+		return 0;
+
+	data->type = EVENT_TYPE_RECV;
+	data->sock_fd = cache->sockfd;
+	bpf_probe_read(&data->buf, sizeof(data->buf), (void *)cache->buf);
+	bpf_perf_event_output(ctx, &dataevent, BPF_F_CURRENT_CPU, data, sizeof(*data));
+	bpf_map_delete_elem(&probe_cache, &pid);
+	return 0;
+}
+
+//
+// sys_sendto
+//
+SEC("kprobe/sys_sendto")
+int kprobe__sys_sendto(struct pt_regs *ctx) {
+	int sockfd = (int)PT_REGS_PARM1(ctx);
+	char *buf;
+	buf = (char *)PT_REGS_PARM2(ctx);
+
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct connectlist_t *connect;
+	connect = bpf_map_lookup_elem(&connectlist, &pid);
+	if (connect == 0)
+		return 0;
+
+	struct probe_cache_t cache = {};
+	cache.sockfd = sockfd; 
+	cache.buf = buf;
+	bpf_map_update_elem(&probe_cache, &pid, &cache, BPF_ANY);
+	return 0;
+}
+SEC("kretprobe/sys_sendto")
+int kretprobe__sys_sendto(struct pt_regs *ctx) {
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct probe_cache_t* cache;
+	cache = bpf_map_lookup_elem(&probe_cache, &pid);
+	if (cache == 0)
+		return 0;
+	
+	int zero = 0;
+	struct dataevent_t* data = bpf_map_lookup_elem(&messagelist, &zero);
+	if (!data)
+		return 0;
+
+	data->type = EVENT_TYPE_SEND;
+	data->sock_fd = cache->sockfd;
+	bpf_probe_read(&data->buf, sizeof(data->buf), (void *)cache->buf);
+	bpf_perf_event_output(ctx, &dataevent, BPF_F_CURRENT_CPU, data, sizeof(*data));
+	bpf_map_delete_elem(&probe_cache, &pid);
+	return 0;
+}
+
+//
+// sys_close
+//
+SEC("kprobe/sys_close")
+int kprobe__sys_close(struct pt_regs *ctx) {
+	int sockfd = PT_REGS_PARM1(ctx);
+
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct connectlist_t *connect;
+	connect = bpf_map_lookup_elem(&connectlist, &pid);
+	if (connect == 0)
+		return 0;
+
+	int zero = 0;
+	struct dataevent_t* data = bpf_map_lookup_elem(&messagelist, &zero);
+	if (!data)
+		return 0;
+
+	data->type = EVENT_TYPE_CLOSE;
+	data->sock_fd = sockfd;
+
+	bpf_perf_event_output(ctx, &dataevent, BPF_F_CURRENT_CPU, data, sizeof(*data));
+
+	return 0;
+}
+/* printk
+   const char fmt_str[] = "close(%d)\n";
+   bpf_trace_printk(fmt_str, sizeof(fmt_str), fd);
+*/
+
+/*SEC("kretprobe/sys_close")
 int kretprobe__tcp_v4_connect(struct pt_regs *ctx) {
 	u32 pid = bpf_get_current_pid_tgid();
 
@@ -81,88 +229,6 @@ int kretprobe__tcp_v4_connect(struct pt_regs *ctx) {
 	if (sk == 0) {
 		return 0;
 	}
-	// bpf_trace_printk("sockp->sk_family: %d\\n", sk->__sk_common.skc_dport);
+	
 	return 0;
-}
-
-//
-// recvfrom
-//
-SEC("kprobe/sys_recvfrom")
-int kprobe__sys_recvfrom(struct pt_regs *ctx) {
-	char *buf;
-	buf = (char *)PT_REGS_PARM2(ctx);
-
-	u32 pid = bpf_get_current_pid_tgid();
-
-	struct sock *sk;
-	sk = bpf_map_lookup_elem(&connectlist, &pid);
-	if (sk == 0)
-		return 0;
-	bpf_map_update_elem(&recvfromlist, &pid, &buf, BPF_ANY);
-	return 0;
-}
-SEC("kretprobe/sys_recvfrom")
-int kretprobe__sys_recvfrom(struct pt_regs *ctx) {
-	u32 pid = bpf_get_current_pid_tgid();
-
-	char **buf, *bufp;
-	buf = bpf_map_lookup_elem(&recvfromlist, &pid);
-	if (buf == 0) 
-		return 0;
-	bufp = *buf;
-
-	// Create Buffer on BPF map
-	// BPF stack size is limited to 512 bytes
-	int zero = 0;
-	struct dataevent_t* data = bpf_map_lookup_elem(&messagelist, &zero);
-	if (!data)
-		return 0;
-	bpf_probe_read(&data->buf, sizeof(data->buf), (void *)bufp);
-
-	data->type = EVENT_TYPE_RECV;
-	bpf_perf_event_output(ctx, &dataevent, BPF_F_CURRENT_CPU, data, sizeof(*data));
-	bpf_map_delete_elem(&recvfromlist, &pid);
-	return 0;
-}
-
-//
-// sendto
-//
-SEC("kprobe/sys_sendto")
-int kprobe__sys_sendto(struct pt_regs *ctx) {
-	char *buf;
-	buf = (char *)PT_REGS_PARM2(ctx);
-
-	u32 pid = bpf_get_current_pid_tgid();
-
-	struct sock *sk;
-	sk = bpf_map_lookup_elem(&connectlist, &pid);
-	if (sk == 0)
-		return 0;
-	bpf_map_update_elem(&sendtolist, &pid, &buf, BPF_ANY);
-	return 0;
-}
-SEC("kretprobe/sys_sendto")
-int kretprobe__sys_sendto(struct pt_regs *ctx) {
-	u32 pid = bpf_get_current_pid_tgid();
-
-	char **buf, *bufp;
-	buf = bpf_map_lookup_elem(&sendtolist, &pid);
-	if (buf == 0)
-		return 0;
-	bufp = *buf;
-
-	// Create Buffer on BPF map
-	// BPF stack size is limited to 512 bytes
-	int zero = 0;
-	struct dataevent_t* data = bpf_map_lookup_elem(&messagelist, &zero);
-	if (!data)
-		return 0;
-	data->type = EVENT_TYPE_SEND;
-	bpf_probe_read(&data->buf, sizeof(data->buf), (void *)bufp);
-
-	bpf_perf_event_output(ctx, &dataevent, BPF_F_CURRENT_CPU, data, sizeof(*data));
-	bpf_map_delete_elem(&sendtolist, &pid);
-	return 0;
-}
+}*/
