@@ -85,6 +85,19 @@ func main() {
 	}
 	defer kretprobeSysRead.Close()
 
+	// SysRecv
+	kprobeSysRecv, err := link.Kprobe("sys_recv", objs.KprobeSysRecv)
+	if err != nil {
+		log.Fatalf("opening kprobe: %s", err)
+	}
+	defer kprobeSysRecv.Close()
+
+	kretprobeSysRecv, err := link.Kretprobe("sys_recv", objs.KretprobeSysRecv)
+	if err != nil {
+		log.Fatalf("opening kprobe: %s", err)
+	}
+	defer kretprobeSysRecv.Close()
+
 	// SysRecvfrom
 	kprobeSysRecvfrom, err := link.Kprobe("sys_recvfrom", objs.KprobeSysRecvfrom)
 	if err != nil {
@@ -110,6 +123,19 @@ func main() {
 		log.Fatalf("opening kprobe: %s", err)
 	}
 	defer kretprobeSysWrite.Close()
+
+	// SysSend
+	kprobeSysSend, err := link.Kprobe("sys_send", objs.KprobeSysSend)
+	if err != nil {
+		log.Fatalf("opening kprobe: %s", err)
+	}
+	defer kprobeSysSend.Close()
+
+	kretprobeSysSend, err := link.Kretprobe("sys_send", objs.KretprobeSysSend)
+	if err != nil {
+		log.Fatalf("opening kprobe: %s", err)
+	}
+	defer kretprobeSysSend.Close()
 
 	// SysSendto
 	kprobeSysSendto, err := link.Kprobe("sys_sendto", objs.KprobeSysSendto)

@@ -142,6 +142,50 @@ int kretprobe__sys_read(struct pt_regs *ctx) {
 }
 
 //
+// sys_recv
+//
+SEC("kprobe/sys_recv")
+int kprobe__sys_recv(struct pt_regs *ctx) {
+	int sockfd = (int)PT_REGS_PARM1(ctx);
+	char *buf;
+	buf = (char *)PT_REGS_PARM2(ctx);
+
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct connectlist_t *connect;
+	connect = bpf_map_lookup_elem(&connectlist, &pid);
+	if (connect == 0)
+		return 0;
+
+	struct probe_cache_t cache = {};
+	cache.sockfd = sockfd; 
+	cache.buf = buf;
+	bpf_map_update_elem(&probe_cache, &pid, &cache, BPF_ANY);
+	return 0;
+}
+SEC("kretprobe/sys_recv")
+int kretprobe__sys_recv(struct pt_regs *ctx) {
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct probe_cache_t* cache;
+	cache = bpf_map_lookup_elem(&probe_cache, &pid);
+	if (cache == 0) 
+		return 0;
+
+	int zero = 0;
+	struct dataevent_t* data = bpf_map_lookup_elem(&messagelist, &zero);
+	if (!data)
+		return 0;
+
+	data->type = EVENT_TYPE_RECV;
+	data->sock_fd = cache->sockfd;
+	bpf_probe_read(&data->buf, sizeof(data->buf), (void *)cache->buf);
+	bpf_perf_event_output(ctx, &dataevent, BPF_F_CURRENT_CPU, data, sizeof(*data));
+	bpf_map_delete_elem(&probe_cache, &pid);
+	return 0;
+}
+
+//
 // sys_recvfrom
 //
 SEC("kprobe/sys_recvfrom")
@@ -209,6 +253,50 @@ int kprobe__sys_write(struct pt_regs *ctx) {
 }
 SEC("kretprobe/sys_write")
 int kretprobe__sys_write(struct pt_regs *ctx) {
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct probe_cache_t* cache;
+	cache = bpf_map_lookup_elem(&probe_cache, &pid);
+	if (cache == 0)
+		return 0;
+	
+	int zero = 0;
+	struct dataevent_t* data = bpf_map_lookup_elem(&messagelist, &zero);
+	if (!data)
+		return 0;
+
+	data->type = EVENT_TYPE_SEND;
+	data->sock_fd = cache->sockfd;
+	bpf_probe_read(&data->buf, sizeof(data->buf), (void *)cache->buf);
+	bpf_perf_event_output(ctx, &dataevent, BPF_F_CURRENT_CPU, data, sizeof(*data));
+	bpf_map_delete_elem(&probe_cache, &pid);
+	return 0;
+}
+
+//
+// sys_send
+//
+SEC("kprobe/sys_send")
+int kprobe__sys_send(struct pt_regs *ctx) {
+	int sockfd = (int)PT_REGS_PARM1(ctx);
+	char *buf;
+	buf = (char *)PT_REGS_PARM2(ctx);
+
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct connectlist_t *connect;
+	connect = bpf_map_lookup_elem(&connectlist, &pid);
+	if (connect == 0)
+		return 0;
+
+	struct probe_cache_t cache = {};
+	cache.sockfd = sockfd; 
+	cache.buf = buf;
+	bpf_map_update_elem(&probe_cache, &pid, &cache, BPF_ANY);
+	return 0;
+}
+SEC("kretprobe/sys_send")
+int kretprobe__sys_send(struct pt_regs *ctx) {
 	u32 pid = bpf_get_current_pid_tgid();
 
 	struct probe_cache_t* cache;
