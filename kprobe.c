@@ -67,15 +67,11 @@ int kprobe__sys_connect(struct pt_regs *ctx) {
 	struct sock *sk;
 	sk = (struct sock *)PT_REGS_PARM1(ctx);
 
-	char comm[TASK_COMM_LEN];
-	bpf_get_current_comm(&comm, sizeof(comm));
+	struct connectlist_t connect = {};
+	connect.sockfd = sockfd;
+	connect.sock = sk;
+	bpf_map_update_elem(&connectlist, &pid, &connect, BPF_ANY);
 
-	if (comm[0] == 'c' && comm[1] == 'u') {
-		struct connectlist_t connect = {};
-		connect.sockfd = sockfd;
-		connect.sock = sk;
-		bpf_map_update_elem(&connectlist, &pid, &connect, BPF_ANY);
-	}
 	return 0;
 }
 SEC("kretprobe/sys_connect")
@@ -98,6 +94,50 @@ int kretprobe__sys_connect(struct pt_regs *ctx) {
 
 	bpf_perf_event_output(ctx, &dataevent, BPF_F_CURRENT_CPU, data, sizeof(*data));
 
+	return 0;
+}
+
+//
+// sys_read
+//
+SEC("kprobe/sys_read")
+int kprobe__sys_read(struct pt_regs *ctx) {
+	int sockfd = (int)PT_REGS_PARM1(ctx);
+	char *buf;
+	buf = (char *)PT_REGS_PARM2(ctx);
+
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct connectlist_t *connect;
+	connect = bpf_map_lookup_elem(&connectlist, &pid);
+	if (connect == 0)
+		return 0;
+
+	struct probe_cache_t cache = {};
+	cache.sockfd = sockfd; 
+	cache.buf = buf;
+	bpf_map_update_elem(&probe_cache, &pid, &cache, BPF_ANY);
+	return 0;
+}
+SEC("kretprobe/sys_read")
+int kretprobe__sys_read(struct pt_regs *ctx) {
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct probe_cache_t* cache;
+	cache = bpf_map_lookup_elem(&probe_cache, &pid);
+	if (cache == 0) 
+		return 0;
+
+	int zero = 0;
+	struct dataevent_t* data = bpf_map_lookup_elem(&messagelist, &zero);
+	if (!data)
+		return 0;
+
+	data->type = EVENT_TYPE_RECV;
+	data->sock_fd = cache->sockfd;
+	bpf_probe_read(&data->buf, sizeof(data->buf), (void *)cache->buf);
+	bpf_perf_event_output(ctx, &dataevent, BPF_F_CURRENT_CPU, data, sizeof(*data));
+	bpf_map_delete_elem(&probe_cache, &pid);
 	return 0;
 }
 
@@ -144,6 +184,51 @@ int kretprobe__sys_recvfrom(struct pt_regs *ctx) {
 	bpf_map_delete_elem(&probe_cache, &pid);
 	return 0;
 }
+
+//
+// sys_write
+//
+SEC("kprobe/sys_write")
+int kprobe__sys_write(struct pt_regs *ctx) {
+	int sockfd = (int)PT_REGS_PARM1(ctx);
+	char *buf;
+	buf = (char *)PT_REGS_PARM2(ctx);
+
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct connectlist_t *connect;
+	connect = bpf_map_lookup_elem(&connectlist, &pid);
+	if (connect == 0)
+		return 0;
+
+	struct probe_cache_t cache = {};
+	cache.sockfd = sockfd; 
+	cache.buf = buf;
+	bpf_map_update_elem(&probe_cache, &pid, &cache, BPF_ANY);
+	return 0;
+}
+SEC("kretprobe/sys_write")
+int kretprobe__sys_write(struct pt_regs *ctx) {
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct probe_cache_t* cache;
+	cache = bpf_map_lookup_elem(&probe_cache, &pid);
+	if (cache == 0)
+		return 0;
+	
+	int zero = 0;
+	struct dataevent_t* data = bpf_map_lookup_elem(&messagelist, &zero);
+	if (!data)
+		return 0;
+
+	data->type = EVENT_TYPE_SEND;
+	data->sock_fd = cache->sockfd;
+	bpf_probe_read(&data->buf, sizeof(data->buf), (void *)cache->buf);
+	bpf_perf_event_output(ctx, &dataevent, BPF_F_CURRENT_CPU, data, sizeof(*data));
+	bpf_map_delete_elem(&probe_cache, &pid);
+	return 0;
+}
+
 
 //
 // sys_sendto
