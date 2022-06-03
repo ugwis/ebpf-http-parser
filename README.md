@@ -23,4 +23,4 @@ The Dockerfile of `cilium/ebpf` will be a reference for building environment.
 - [ ] HTTPS with `LibreSSL`
 - [ ] HTTPS with `GnuSSL`
 - [ ] HTTPS with `BoringSSL`
-- [ ] HTTP/2
+- [ ] HTTP/2 with `nghttp2`
